@@ -30,7 +30,7 @@ class ImagePaths(Dataset):
         if not image.mode == "RGB":
             image = image.convert("RGB")
         image = np.array(image).astype(np.uint8)
-        image = self.preprocessor(image=image)["image"]
+        image = self.preprocessor(image=image)["image"].astype(np.float32)
         image = (image/127.5 - 1.0).astype(np.float32)
         return image
 
@@ -67,7 +67,8 @@ class ImageNetBase(Dataset):
             l1 = len(self.relpaths)
             self.relpaths = self._filter_relpaths(self.relpaths)
             print("Removed {} files from filelist during filtering.".format(l1 - len(self.relpaths)))
-        self.abspaths = [os.path.join(self.datadir, p) for p in self.relpaths]
+        # TODO: Remove manual data set size
+        self.abspaths = [os.path.join(self.datadir, p) for p in self.relpaths][: 100_000]
 
         self.data = ImagePaths(self.abspaths,
                                size=256,

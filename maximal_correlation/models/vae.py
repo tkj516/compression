@@ -8,11 +8,16 @@ from typing import Mapping, Any, List, Tuple
 
 from modules import encoder, decoder
 from dataclasses import dataclass
+from modules.massagers import SimpleMassager, NoMassager
 
 
 REGISTER = {
     "BMSHJEncoder": encoder.BMSHJEncoder,
     "BMSHJDecoder": decoder.BMSHJDecoder,
+    "ConvEncoder": encoder.ConvEncoder,
+    "ConvDecoder": decoder.ConvDecoder,
+    "SimpleMassager": SimpleMassager,
+    "NoMassager": NoMassager,
 }
 
 
@@ -34,18 +39,24 @@ class DecoderConfig:
     hidden_channels: int = 192
 
 
+@dataclass
+class MassagerConfig:
+    channels: int  = 192
+
+
 class GaussianVAE(nn.Module):
     def __init__(
         self,
         encoder_config: Mapping[str, Any],
         decoder_config: Mapping[str, Any],
+        massager_config: Mapping[str, Any],
     ):
         super().__init__()
 
         self.encoder_config = dacite.from_dict(EncoderConfig, encoder_config[1])
-        self.decoder_config = dacite.from_dict(DecoderConfig, decoder_config[1])
         self.encoder = build_registered_class(encoder_config)
         self.decoder = build_registered_class(decoder_config)
+        self.massager = build_registered_class(massager_config)
 
         self.post_conv = nn.Conv2d(
             in_channels=self.encoder_config.hidden_channels,
@@ -56,6 +67,9 @@ class GaussianVAE(nn.Module):
     def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mean, logvar = torch.chunk(self.post_conv(self.encoder(x)), chunks=2, dim=1)
         return mean, logvar
+
+    def massage(self, x: torch.Tensor) -> torch.Tensor:
+        return self.massager(x)
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(x)
@@ -71,6 +85,7 @@ class GaussianVAE(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         mean, logvar = self.encode(x)
         sample = self.sample(mean, logvar)
-        recon = self.decode(sample)
+        massaged_sample = self.massager(sample)
+        recon = self.decode(massaged_sample)
         return mean, logvar, recon
         

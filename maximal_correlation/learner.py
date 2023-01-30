@@ -1,5 +1,5 @@
 import os
-from typing import Dict
+from typing import Dict, List
 import dacite
 
 import matplotlib.pyplot as plt
@@ -18,7 +18,7 @@ from losses.kl import KLLoss
 from dataclasses import dataclass
 from ml_collections import ConfigDict
 from dataset import ImageNetTrain
-from configs.base_configs import TrainerConfig
+from configs.base_configs import TrainerConfig, KLLossConfig
 
 
 def get_train_val_dataset(dataset: Dataset, train_fraction: float):
@@ -41,12 +41,26 @@ class Learner:
         self.build_dataloaders()
 
         self.model = model
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=self.trainer_config.learning_rate)
+        self.optimizer_vae = torch.optim.Adam(
+            list(self.model.encoder.parameters()) + list(self.model.decoder.parameters()), 
+            lr=self.trainer_config.learning_rate
+        )
+        if sum([1 for _ in self.model.massager.parameters()]) != 0:
+            self.using_massager = True
+            self.optimizer_massager = torch.optim.Adam(
+                self.model.massager.parameters(),
+                lr=self.trainer_config.learning_rate,
+            )
+        else:
+            self.using_massager = False
         self.step = 0
 
         # Define the loss functions
-        self.kl = KLLoss(**cfg.vae_loss_config)
+        self.kl_loss_config = dacite.from_dict(KLLossConfig, cfg.vae_loss_config)
+        self.kl = KLLoss(
+            min_logvar=self.kl_loss_config.min_logvar,
+            max_logvar=self.kl_loss_config.max_logvar,
+        )
         self.hscore = NegativeHScore(**cfg.hscore_loss_config)
         self.l1 = nn.L1Loss()
 
@@ -88,7 +102,8 @@ class Learner:
         return {
             'step': self.step,
             'model': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in model_state.items()},
-            'optimizer': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer.state_dict().items()},
+            'optimizer_vae': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_vae.state_dict().items()},
+            'optimizer_massager': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_massager.state_dict().items()} if self.using_massager else {},
             'cfg': self.cfg.to_dict(),
         }
 
@@ -97,8 +112,9 @@ class Learner:
             self.model.module.load_state_dict(state_dict['model'])
         else:
             self.model.load_state_dict(state_dict['model'])
-        self.optimizer.load_state_dict(state_dict['optimizer'])
-        self.scaler.load_state_dict(state_dict['scaler'])
+        self.optimizer_vae.load_state_dict(state_dict['optimizer_vae'])
+        if self.using_massager:
+            self.optimizer_massager.load_state_dict(state_dict['optimizer_massager'])
         self.step = state_dict['step']
 
     def save_to_checkpoint(self, filename='weights'):
@@ -138,7 +154,7 @@ class Learner:
                         f'Detected NaN loss at step {self.step}.')
 
                 if self.is_master:
-                    if self.step % self.trainer_config.validate_every == 0:
+                    if self.step > 0 and self.step % self.trainer_config.validate_every == 0:
                         self.validate()
                     if self.step % self.trainer_config.save_every == 0:
                         self.save_to_checkpoint()
@@ -158,24 +174,41 @@ class Learner:
     def train_step(self, x: torch.Tensor, logging_rank: bool = False):
         mean, logvar = self.model.encode(x)
 
-        if self.step % 2 == 0:
-            # Optimize the VAE
-            sample = self.model.sample(mean, logvar)
+        if self.step % 2 == 0 or not self.using_massager:
+            optimizer = self.optimizer_vae
+            # Optimize the VAE and don't optimize the massager
+            sample = self.model.massager(self.model.sample(mean, logvar))
             recon = self.model.decode(sample)
+
             kl_loss = self.kl(mean, logvar)
             l1_loss = self.l1(recon, x)
-            loss = kl_loss + l1_loss
+            # TODO: Check the weighting between these losses
+            loss = self.kl_loss_config.kld_weight * kl_loss + l1_loss
             if logging_rank and self.step % self.trainer_config.log_every == 0:
-                self.writer.add_scalar('train/kl_loss', kl_loss)
-                self.writer.add_scalar('train/l1_loss', l1_loss)
-                self.writer.add_scalar('train/vae_loss', loss)
+                self.writer.add_scalar('train/kl_loss', kl_loss, self.step)
+                self.writer.add_scalar('train/l1_loss', l1_loss, self.step)
+                self.writer.add_scalar('train/vae_loss', loss, self.step)
+                self.writer.add_images('train/gt', (x + 1) / 2.0, self.step)
+                self.writer.add_images('train/recon', (recon + 1) / 2.0, self.step)
+                
         else:
-            # Optimize the HScore
+            optimizer = self.optimizer_massager
+            # Optimize the Massager
             sample_0 = self.model.sample(mean, logvar)
             sample_1 = self.model.sample(mean, logvar)
-            loss = self.hscore(sample_0, sample_1)
+            b, c, h, w = sample_0.shape
+
+            # Reshape inputs for loss calculation
+            sample_0 = sample_0.permute(0, 2, 3, 1).reshape(b * h * w, c)
+            sample_1 = sample_1.permute(0, 2, 3, 1).reshape(b * h * w, c)
+            # TODO: Check what buffer psi should be
+            loss = self.hscore(sample_0, sample_1, buffer_psi=None)
             if logging_rank and self.step % self.trainer_config.log_every == 0:
-                self.writer.add_scalar('train/hscore', loss)
+                self.writer.add_scalar('train/hscore', loss, self.step)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
         return loss
 
@@ -190,7 +223,7 @@ class Learner:
         for inputs in tqdm(self.val_dataloader, desc=f"Running validation after step {self.step}"):
             x = inputs["image"].to(device)
             # Use the underlying module to get the losses
-            if self.distributed:
+            if self.trainer_config.distributed:
                 mean, logvar, recon = self.model.module(x)
             else:
                 mean, logvar, recon = self.model(x)
@@ -198,14 +231,16 @@ class Learner:
             loss_l1 = self.l1(recon, x)
             kl_loss += loss_kl
             l1_loss += loss_l1
-            loss += (loss_kl + loss_l1)
+            loss += (self.kl_loss_config.kld_weight * loss_kl + loss_l1)
         kl_loss = kl_loss / len(self.val_dataset)
         l1_loss = l1_loss / len(self.val_dataset)
         loss = loss / len(self.val_dataset)
 
         self.writer.add_scalar('val/kl_loss', kl_loss, self.step)
         self.writer.add_scalar('val/l1_loss', l1_loss, self.step)
-        self.writer.add_scalar('val/vae_loss', )
+        self.writer.add_scalar('val/vae_loss', loss, self.step)
+        self.writer.add_images('val/gt', (x + 1) / 2.0, self.step)
+        self.writer.add_images('val/recon', (recon + 1) / 2.0, self.step)
         self.model.train()
 
         return loss
