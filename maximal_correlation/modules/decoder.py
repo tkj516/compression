@@ -1,7 +1,7 @@
 import torch
 from torch import nn
-from modules.layers import deconv5x5s2
-from compressai.layers import GDN
+from modules.layers import deconv5x5s2, ELICResidualBlock
+from compressai.layers import GDN, AttentionBlock
 
 
 class BMSHJDecoder(nn.Module):
@@ -63,3 +63,45 @@ class ConvDecoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.final_layer(self.body(self.inital(x)))
+
+
+class ELICDecoder(nn.Module):
+    """Implementation from paper.
+    https://arxiv.org/pdf/2203.10886.pdf
+    """
+
+    def __init__(
+        self, 
+        in_channels: int = 256,
+        hidden_channels: int = 192, 
+        out_channels: int = 3,
+        configuration: str = "L",
+    ):
+        super().__init__()
+        if configuration == "S":
+            self.model = nn.Sequential(
+                deconv5x5s2(in_channels, hidden_channels),
+                ELICResidualBlock(hidden_channels, num_layers=1),
+                deconv5x5s2(hidden_channels, hidden_channels),
+                ELICResidualBlock(hidden_channels, num_layers=1),
+                deconv5x5s2(hidden_channels, hidden_channels),
+                ELICResidualBlock(hidden_channels, num_layers=1),
+                deconv5x5s2(hidden_channels, out_channels),
+            )
+        elif configuration == "L":
+            self.model = nn.Sequential(
+                AttentionBlock(in_channels),
+                deconv5x5s2(in_channels, hidden_channels),
+                ELICResidualBlock(hidden_channels, num_layers=3),
+                deconv5x5s2(hidden_channels, hidden_channels),
+                AttentionBlock(hidden_channels),
+                ELICResidualBlock(hidden_channels, num_layers=3),
+                deconv5x5s2(hidden_channels, hidden_channels),
+                ELICResidualBlock(hidden_channels, num_layers=3),
+                deconv5x5s2(hidden_channels, out_channels),
+            )
+        else:
+            raise ValueError(f"Unknown configuration {configuration}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
