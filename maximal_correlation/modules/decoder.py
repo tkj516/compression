@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from layers import deconv5x5s2
+from modules.layers import deconv5x5s2
 from compressai.layers import GDN
 
 
