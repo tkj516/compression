@@ -52,7 +52,8 @@ class NegativeHScore:  # Frobenius norm for maximal correlation
             psi = centralize(psi)
 
         # correlation
-        loss = - 2 * (phi * psi).sum(-1)  # (B, )
+        # NOTE: Added mean here
+        loss = - 2 * (phi * psi).sum(-1).mean()  # (B, )
 
         # compute "correlation" term
         if self.compute_over_batch:  # complexity = B * B * L
@@ -69,6 +70,6 @@ class NegativeHScore:  # Frobenius norm for maximal correlation
         # nuclear norm regularization based on its variational form
         regularizaton = 0.
         if self.nuclear_norm_weight > 0:
-            regularizaton = .5 * ((phi ** 2).sum(-1) + (psi ** 2).sum(-1))  # (B, )
+            regularizaton = .5 * ((phi ** 2).sum(-1) + (psi ** 2).sum(-1)).mean(0)  # (B, )
 
         return (loss + self.nuclear_norm_weight * regularizaton).sum(0)
