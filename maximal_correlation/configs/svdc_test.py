@@ -3,7 +3,7 @@ def get_config():
         rd_lambda = 0.18,
         model_config = dict(
             augmentation_config = [
-                "NoAugmentation",
+                "AdditiveGaussianNoise",
             ],
             encoder_config = [
                 "BMSHJEncoder",
@@ -33,6 +33,8 @@ def get_config():
         trainer_config = dict(
             model_dir="checkpoints/svdc_test",
             distributed=False,
+            batch_size=16,
+            hscore_start=5_000,
         ),
     )
     return config

@@ -19,14 +19,20 @@ from losses.hscore import NegativeHScore
 from ml_collections import ConfigDict
 from dataset import ImageNetTrain
 from configs.base_configs import TrainerConfig
+from compressai.optimizers import net_aux_optimizer
 from maximal_correlation.utils.class_builder import ClassBuilder
 
 
 def get_train_val_dataset(dataset: Dataset, train_fraction: float):
     train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_fraction, 1 - train_fraction], 
+        dataset, [train_fraction, 1 - train_fraction],
         generator=torch.Generator().manual_seed(42))
     return train_dataset, val_dataset
+
+
+def quantize_image(image):
+    image = torch.round(image * 255)
+    return image.clamp(0, 255).byte()
 
 
 @dataclass
@@ -35,6 +41,7 @@ class AdamConfig:
     betas: Tuple[float, float] = (0.9, 0.999)
     weight_decay: float = 0.0
     amsgrad: bool = False
+
 
 OPTIMIZER_REGISTER = {
     "Adam": torch.optim.Adam,
@@ -54,7 +61,7 @@ class Learner:
         self.rank = rank
         self.cfg = cfg
         self.step = 0
-        
+
         self.trainer_config = dacite.from_dict(
             TrainerConfig, cfg.trainer_config)
         self.build_dataloaders()
@@ -67,14 +74,12 @@ class Learner:
             params=self.model.encoder.parameters(),
             config=cfg.optimizer_e_config,
         )
-        self.optimizer_ed = optimizer_builder.build_class(
-            params=set(p for n, p in self.model.named_parameters() if not n.endswith(".quantiles")),
-            config=cfg.optimizer_ed_config
-        )
-        self.optimizer_aux = optimizer_builder.build_class(
-            params=set(p for n, p in self.model.named_parameters() if n.endswith(".quantiles")),
-            config=cfg.optimizer_aux_config,
-        )
+        conf = {
+            "net": {**{"type": cfg.optimizer_ed_config[0]}, **cfg.optimizer_ed_config[1]},
+            "aux": {**{"type": cfg.optimizer_aux_config[0]}, **cfg.optimizer_aux_config[1]},
+        }
+        optimizer = net_aux_optimizer(self.model, conf)
+        self.optimizer_ed, self.optimizer_aux = optimizer["net"], optimizer["aux"]
 
         self.hscore = NegativeHScore(
             feature_dim=self.model.encoder_config.out_channels
@@ -118,12 +123,12 @@ class Learner:
         else:
             model_state = self.model.state_dict()
         return {
-            'step': self.step,
-            'model': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in model_state.items()},
-            'optimizer_e': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_e.state_dict().items()},
-            'optimizer_ed': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_ed.state_dict().items()},
-            'optimizer_aux': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_aux.state_dict().items()},
-            'cfg': self.cfg.to_dict(),
+            "step": self.step,
+            "model": model_state,
+            "optimizer_e": self.optimizer_e.state_dict(),
+            "optimizer_ed": self.optimizer_ed.state_dict(),
+            "optimizer_aux": self.optimizer_aux.state_dict(),
+            "cfg":  self.cfg.to_dict(),
         }
 
     def load_state_dict(self, state_dict):
@@ -156,8 +161,9 @@ class Learner:
             return False
 
     def hscore_step(self) -> bool:
-        if self.step >= self.trainer_config.hscore_start and self.step % 2 == 0:
+        if self.step >= self.trainer_config.hscore_start and self.step % 2 == 1:
             return True
+        return False
 
     def train(self):
         device = next(self.model.parameters()).device
@@ -198,8 +204,7 @@ class Learner:
         if self.hscore_step():
             # Optimize the encoder and don't optimize the entropy model
             # or the decoder
-            optimizer = self.optimizer_e
-            optimizer.zero_grad()
+            self.optimizer_e.zero_grad()
 
             # 1. Get two augmented inputs
             augmented = self.model.augment(x, num_samples=2)
@@ -217,16 +222,13 @@ class Learner:
             loss = self.hscore(phi, psi, buffer_psi=None)
 
             loss.backward()
-            optimizer.step()
+            self.optimizer_e.step()
 
-            if logging_rank and self.step % self.trainer_config.log_every == 0:
+            if logging_rank and self.step % self.trainer_config.log_every == 1:
                 self.writer.add_scalar('train/hscore_loss', loss, self.step)
         else:
-            optimizer = self.optimizer_ed
-            aux_optimizer = self.optimizer_aux
-
-            optimizer.zero_grad()
-            aux_optimizer.zero_grad()
+            self.optimizer_ed.zero_grad()
+            self.optimizer_aux.zero_grad()
 
             outputs = self.model(x, num_samples=8)
             recon, likelihoods = outputs["x_hat"], outputs["y_likelihoods"]
@@ -234,27 +236,33 @@ class Learner:
             b, _, h, w = x.shape
             num_pixels = b * h * w
 
-            bpp_loss = torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
+            bpp_loss = torch.log(likelihoods).sum() / \
+                (-math.log(2) * num_pixels)
             mse_loss = F.mse_loss(x, recon)
             rd_loss = bpp_loss + self.rd_lambda * (255.0 ** 2) * mse_loss
 
             rd_loss.backward()
-            optimizer.step()
+            if self.trainer_config.clip_max_norm > 0:
+                torch.nn.utils.clip_grad_norm(
+                    self.model.parameters(), self.trainer_config.clip_max_norm)
+            self.optimizer_ed.step()
 
             aux_loss = self.model.entropy_bottleneck.loss()
             aux_loss.backward()
-            aux_optimizer.step()
+            self.optimizer_aux.step()
 
             loss = rd_loss + aux_loss
-            
+
             if logging_rank and self.step % self.trainer_config.log_every == 0:
                 self.writer.add_scalar('train/bpp', bpp_loss, self.step)
                 self.writer.add_scalar('train/mse', mse_loss, self.step)
                 self.writer.add_scalar('train/aux_loss', aux_loss, self.step)
                 self.writer.add_scalar('train/rd_loss', rd_loss, self.step)
-                self.writer.add_scalar('train/psnr', -10 / math.log(10) * torch.log(mse_loss), self.step)
-                self.writer.add_images('train/gt', x, self.step)
-                self.writer.add_images('train/recon', recon, self.step)
+                self.writer.add_scalar(
+                    'train/psnr', -10 / math.log(10) * torch.log(mse_loss), self.step)
+                self.writer.add_images('train/gt', quantize_image(x), self.step)
+                self.writer.add_images(
+                    'train/recon', quantize_image(recon), self.step)
         return loss
 
     @torch.no_grad()
@@ -278,7 +286,8 @@ class Learner:
             b, _, h, w = x.shape
             num_pixels = b * h * w
 
-            bpp_loss = torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
+            bpp_loss = torch.log(likelihoods).sum() / \
+                (-math.log(2) * num_pixels)
             mse_loss = F.mse_loss(x, recon)
             rd_loss = bpp_loss + self.rd_lambda * 255.0 ** 2 * mse_loss
             aux_loss = self.model.entropy_bottleneck.loss()
@@ -296,9 +305,10 @@ class Learner:
         self.writer.add_scalar('val/mse', mse, self.step)
         self.writer.add_scalar('val/aux_loss', aux, self.step)
         self.writer.add_scalar('val/rd_loss', loss, self.step)
-        self.writer.add_scalar('val/psnr', -10 / math.log(10) * torch.log(mse), self.step)
-        self.writer.add_images('val/gt', x, self.step)
-        self.writer.add_images('val/recon', recon, self.step)
+        self.writer.add_scalar('val/psnr', -10 / math.log(10)
+                               * torch.log(mse), self.step)
+        self.writer.add_images('val/gt', quantize_image(x), self.step)
+        self.writer.add_images('val/recon', quantize_image(recon), self.step)
         self.model.train()
 
         return loss
