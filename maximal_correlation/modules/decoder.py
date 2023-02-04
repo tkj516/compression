@@ -36,24 +36,28 @@ class ConvDecoder(nn.Module):
         for i in range(len(hidden_dims) - 1):
             modules.append(
                 nn.Sequential(
-                    nn.ConvTranspose2d(hidden_dims[i],
-                                       hidden_dims[i + 1],
-                                       kernel_size=3,
-                                       stride=2,
-                                       padding=1,
-                                       output_padding=1),
+                    nn.ConvTranspose2d(
+                        hidden_dims[i],
+                        hidden_dims[i + 1],
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                        output_padding=1
+                    ),
                     nn.BatchNorm2d(hidden_dims[i + 1]),
                     nn.LeakyReLU())
             )
         self.body = nn.Sequential(*modules)
 
         self.final_layer = nn.Sequential(
-            nn.ConvTranspose2d(hidden_dims[-1],
-                               hidden_dims[-1],
-                               kernel_size=3,
-                               stride=2,
-                               padding=1,
-                               output_padding=1),
+            nn.ConvTranspose2d(
+                hidden_dims[-1],
+                hidden_dims[-1],
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=1
+            ),
             nn.BatchNorm2d(hidden_dims[-1]),
             nn.LeakyReLU(),
             nn.Conv2d(hidden_dims[-1], out_channels=out_channels,

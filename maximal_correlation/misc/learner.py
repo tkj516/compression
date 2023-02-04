@@ -1,46 +1,26 @@
 import os
-import math
 import dacite
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
-
-from dataclasses import dataclass
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from typing import Tuple
 
-from models.svdc import SVDC
+from models.vae import GaussianVAE
 from losses.hscore import NegativeHScore
+from losses.kl import KLLoss
 from ml_collections import ConfigDict
 from dataset import ImageNetTrain
-from configs.base_configs import TrainerConfig
-from maximal_correlation.utils.class_builder import ClassBuilder
+from configs.base_configs import TrainerConfig, KLLossConfig
 
 
 def get_train_val_dataset(dataset: Dataset, train_fraction: float):
     train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_fraction, 1 - train_fraction], 
-        generator=torch.Generator().manual_seed(42))
+        dataset, [train_fraction, 1 - train_fraction], generator=torch.Generator().manual_seed(42))
     return train_dataset, val_dataset
-
-
-@dataclass
-class AdamConfig:
-    lr: float = 2e-4
-    betas: Tuple[float, float] = (0.9, 0.999)
-    weight_decay: float = 0.0
-    amsgrad: bool = False
-
-OPTIMIZER_REGISTER = {
-    "Adam": torch.optim.Adam,
-    "AdamW": torch.optim.AdamW,
-}
-optimizer_builder = ClassBuilder(OPTIMIZER_REGISTER, AdamConfig)
 
 
 class Learner:
@@ -50,38 +30,39 @@ class Learner:
         cfg: ConfigDict,
         rank: int
     ):
-        # Store some important variables
+        # Store some import variables
         self.rank = rank
         self.cfg = cfg
-        self.step = 0
-        
         self.trainer_config = dacite.from_dict(
             TrainerConfig, cfg.trainer_config)
         self.build_dataloaders()
 
-        # Store the model
         self.model = model
+        self.optimizer_vae = torch.optim.Adam(
+            list(self.model.encoder.parameters()) +
+            list(self.model.decoder.parameters()),
+            lr=self.trainer_config.learning_rate
+        )
+        if sum([1 for _ in self.model.massager.parameters()]) != 0:
+            self.using_massager = True
+            self.optimizer_massager = torch.optim.Adam(
+                self.model.massager.parameters(),
+                lr=self.trainer_config.learning_rate,
+            )
+        else:
+            self.using_massager = False
+        self.step = 0
 
-        # Instantiate the optimizers
-        self.optimizer_e = optimizer_builder.build_class(
-            params=self.model.encoder.parameters(),
-            config=cfg.optimizer_e_config,
+        # Define the loss functions
+        self.kl_loss_config = dacite.from_dict(
+            KLLossConfig, cfg.vae_loss_config)
+        self.kl = KLLoss(
+            min_logvar=self.kl_loss_config.min_logvar,
+            max_logvar=self.kl_loss_config.max_logvar,
         )
-        self.optimizer_ed = optimizer_builder.build_class(
-            params=set(p for n, p in self.model.named_parameters() if not n.endswith(".quantiles")),
-            config=cfg.optimizer_ed_config
-        )
-        self.optimizer_aux = optimizer_builder.build_class(
-            params=set(p for n, p in self.model.named_parameters() if n.endswith(".quantiles")),
-            config=cfg.optimizer_aux_config,
-        )
+        self.hscore = NegativeHScore(**cfg.hscore_loss_config)
+        self.l1 = nn.L1Loss()
 
-        self.hscore = NegativeHScore(
-            feature_dim=self.model.encoder_config.out_channels
-        )
-        self.rd_lambda = cfg.rd_lambda
-
-        # Insantiate a Tensorboard summary writer
         self.writer = SummaryWriter(self.trainer_config.model_dir)
 
     @property
@@ -120,9 +101,8 @@ class Learner:
         return {
             'step': self.step,
             'model': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in model_state.items()},
-            'optimizer_e': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_e.state_dict().items()},
-            'optimizer_ed': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_ed.state_dict().items()},
-            'optimizer_aux': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_aux.state_dict().items()},
+            'optimizer_vae': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_vae.state_dict().items()},
+            'optimizer_massager': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer_massager.state_dict().items()} if self.using_massager else {},
             'cfg': self.cfg.to_dict(),
         }
 
@@ -131,9 +111,10 @@ class Learner:
             self.model.module.load_state_dict(state_dict['model'])
         else:
             self.model.load_state_dict(state_dict['model'])
-        self.optimizer_e.load_state_dict(state_dict['optimizer_e'])
-        self.optimizer_ed.load_state_dict(state_dict['optimizer_ed'])
-        self.optimizer_aux.load_state_dict(state_dict['optimizer_aux'])
+        self.optimizer_vae.load_state_dict(state_dict['optimizer_vae'])
+        if self.using_massager:
+            self.optimizer_massager.load_state_dict(
+                state_dict['optimizer_massager'])
         self.step = state_dict['step']
 
     def save_to_checkpoint(self, filename='weights'):
@@ -154,10 +135,6 @@ class Learner:
             return True
         except FileNotFoundError:
             return False
-
-    def hscore_step(self) -> bool:
-        if self.step >= self.trainer_config.hscore_start and self.step % 2 == 0:
-            return True
 
     def train(self):
         device = next(self.model.parameters()).device
@@ -195,63 +172,47 @@ class Learner:
                     exit(0)
 
     def train_step(self, x: torch.Tensor, logging_rank: bool = False):
-        if self.hscore_step():
-            # Optimize the encoder and don't optimize the entropy model
-            # or the decoder
-            optimizer = self.optimizer_e
-            optimizer.zero_grad()
+        mean, logvar = self.model.encode(x)
 
-            # 1. Get two augmented inputs
-            augmented = self.model.augment(x, num_samples=2)
-            z0, z1 = torch.chunk(augmented, chunks=2, dim=0)
-            z0, z1 = z0.mean(0), z1.mean(0)
+        if self.step % 2 == 0 or not self.using_massager:
+            optimizer = self.optimizer_vae
+            # Optimize the VAE and don't optimize the massager
+            sample = self.model.massager(self.model.sample(mean, logvar))
+            recon = self.model.decode(sample)
 
-            # 2. Encode the augmented inputs
-            f_z = self.model.encode(torch.concatenate([z0, z1], dim=0))
-            f_z0, f_z1 = torch.chunk(f_z, chunks=2, dim=0)
-
-            # 3. Compute the negative hscore loss between the encodings
-            b, c, h, w = f_z0.shape
-            phi = f_z0.permute(0, 2, 3, 1).reshape(b * h * w, c)
-            psi = f_z1.permute(0, 2, 3, 1).reshape(b * h * w, c)
-            loss = self.hscore(phi, psi, biffer_psi=None)
-
-            loss.backward()
-            optimizer.step()
-
+            kl_loss = self.kl(mean, logvar)
+            l1_loss = self.l1(recon, x)
+            # TODO: Check the weighting between these losses
+            loss = self.kl_loss_config.kld_weight * kl_loss + l1_loss
             if logging_rank and self.step % self.trainer_config.log_every == 0:
-                self.writer.add_scalar('train/hscore_loss', loss, self.step)
+                self.writer.add_scalar('train/kl_loss', kl_loss, self.step)
+                self.writer.add_scalar('train/l1_loss', l1_loss, self.step)
+                self.writer.add_scalar('train/vae_loss', loss, self.step)
+                self.writer.add_images('train/gt', (x + 1) / 2.0, self.step)
+                self.writer.add_images(
+                    'train/recon', (recon + 1) / 2.0, self.step)
+
         else:
-            optimizer = self.optimizer_ed
-            aux_optimizer = self.optimizer_aux
+            optimizer = self.optimizer_massager
+            # Optimize the Massager
+            sample_0 = self.model.sample(mean, logvar)
+            sample_1 = self.model.sample(mean, logvar)
+            b, c, h, w = sample_0.shape
 
-            outputs = self.model(x, num_samples=8)
-            recon, likelihoods = outputs["x_hat"], outputs["y_likelihoods"]
-
-            b, _, h, w = x.shape
-            num_pixels = b * h * w
-
-            bpp_loss = torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
-            mse_loss = F.mse_loss(x, recon)
-            rd_loss = bpp_loss + self.rd_lambda * 255.0 ** 2 * mse_loss
-
-            rd_loss.backward()
-            optimizer.step()
-
-            aux_loss = self.model.entropy_bottleneck.loss()
-            aux_loss.backward()
-            aux_optimizer.step()
-
-            loss = rd_loss + aux_loss
-            
+            # Reshape inputs for loss calculation
+            sample_0 = self.model.massager(sample_0).permute(
+                0, 2, 3, 1).reshape(b * h * w, c)
+            sample_1 = self.model.massager(sample_1).permute(
+                0, 2, 3, 1).reshape(b * h * w, c)
+            # TODO: Check what buffer psi should be
+            loss = self.hscore(sample_0, sample_1, buffer_psi=None)
             if logging_rank and self.step % self.trainer_config.log_every == 0:
-                self.writer.add_scalar('train/bpp', bpp_loss, self.step)
-                self.writer.add_scalar('train/mse', mse_loss, self.step)
-                self.writer.add_scalar('train/aux_loss', aux_loss, self.step)
-                self.writer.add_scalar('train/rd_loss', rd_loss, self.step)
-                self.writer.add_scalar('train/psnr', -10 / math.log(10) * torch.log(mse_loss), self.step)
-                self.writer.add_images('train/gt', x, self.step)
-                self.writer.add_images('train/recon', recon, self.step)
+                self.writer.add_scalar('train/hscore', loss, self.step)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
         return loss
 
     @torch.no_grad()
@@ -259,43 +220,30 @@ class Learner:
         device = next(self.model.parameters()).device
         self.model.eval()
 
-        bpp = 0
-        mse = 0
-        aux = 0
+        kl_loss = 0
+        l1_loss = 0
         loss = 0
         for inputs in tqdm(self.val_dataloader, desc=f"Running validation after step {self.step}"):
             x = inputs["image"].to(device)
             # Use the underlying module to get the losses
             if self.trainer_config.distributed:
-                outputs = self.model.module(x, num_samples=8)
+                mean, logvar, recon = self.model.module(x)
             else:
-                outputs = self.model(x, num_samples=8)
-            recon, likelihoods = outputs["x_hat"], outputs["y_likelihoods"]
-
-            b, _, h, w = x.shape
-            num_pixels = b * h * w
-
-            bpp_loss = torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
-            mse_loss = F.mse_loss(x, recon)
-            rd_loss = bpp_loss + self.rd_lambda * 255.0 ** 2 * mse_loss
-            aux_loss = self.model.entropy_bottleneck.loss()
-
-            bpp += bpp_loss
-            mse += mse_loss
-            aux += aux_loss
-            loss += rd_loss
-        bpp = bpp / len(self.val_dataset)
-        mse = mse / len(self.val_dataset)
-        aux = aux / len(self.val_dataset)
+                mean, logvar, recon = self.model(x)
+            loss_kl = self.kl(mean, logvar)
+            loss_l1 = self.l1(recon, x)
+            kl_loss += loss_kl
+            l1_loss += loss_l1
+            loss += (self.kl_loss_config.kld_weight * loss_kl + loss_l1)
+        kl_loss = kl_loss / len(self.val_dataset)
+        l1_loss = l1_loss / len(self.val_dataset)
         loss = loss / len(self.val_dataset)
 
-        self.writer.add_scalar('val/bpp', bpp, self.step)
-        self.writer.add_scalar('val/mse', mse, self.step)
-        self.writer.add_scalar('val/aux_loss', aux, self.step)
-        self.writer.add_scalar('val/rd_loss', loss, self.step)
-        self.writer.add_scalar('val/psnr', -10 / math.log(10) * torch.log(mse), self.step)
-        self.writer.add_images('val/gt', x, self.step)
-        self.writer.add_images('val/recon', recon, self.step)
+        self.writer.add_scalar('val/kl_loss', kl_loss, self.step)
+        self.writer.add_scalar('val/l1_loss', l1_loss, self.step)
+        self.writer.add_scalar('val/vae_loss', loss, self.step)
+        self.writer.add_images('val/gt', (x + 1) / 2.0, self.step)
+        self.writer.add_images('val/recon', (recon + 1) / 2.0, self.step)
         self.model.train()
 
         return loss
@@ -311,7 +259,7 @@ def _train_impl(rank: int, model: nn.Module, cfg: ConfigDict):
 
 def train(cfg: ConfigDict):
     """Training on a single GPU."""
-    model = SVDC(**cfg.model_config).cuda()
+    model = GaussianVAE(**cfg.model_config).cuda()
     _train_impl(0, model, cfg)
 
 
@@ -328,6 +276,6 @@ def train_distributed(rank: int, world_size: int, port, cfg: ConfigDict):
     init_distributed(rank, world_size, port)
     device = torch.device('cuda', rank)
     torch.cuda.set_device(device)
-    model = SVDC(**cfg.model_config).to(device)
+    model = GaussianVAE(**cfg.model_config).to(device)
     model = DistributedDataParallel(model, device_ids=[rank])
     _train_impl(rank, model, cfg)

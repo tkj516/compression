@@ -37,6 +37,7 @@ class ImagePaths(Dataset):
     def __getitem__(self, i):
         example = dict()
         example["image"] = torch.tensor(self.preprocess_image(self.labels["file_path_"][i])).permute(2, 0, 1)
+        example["image"] = (example["image"] + 1) / 2.0
         return example
 
 
@@ -68,7 +69,7 @@ class ImageNetBase(Dataset):
             self.relpaths = self._filter_relpaths(self.relpaths)
             print("Removed {} files from filelist during filtering.".format(l1 - len(self.relpaths)))
         # TODO: Remove manual data set size
-        self.abspaths = [os.path.join(self.datadir, p) for p in self.relpaths][: 100_000]
+        self.abspaths = [os.path.join(self.datadir, p) for p in self.relpaths][: 10_000]
 
         self.data = ImagePaths(self.abspaths,
                                size=256,
