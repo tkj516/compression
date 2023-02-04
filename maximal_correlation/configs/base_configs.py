@@ -16,5 +16,5 @@ class TrainerConfig:
     max_steps: int = 1_000_000
     hscore_start: int = 5_000
 
-    batch_size: int = 16
+    batch_size: int = 32
     train_fraction: float = 0.8

@@ -1,28 +1,15 @@
 def get_config():
     config = dict(
-        rd_lambda = 0.01,
+        rd_lambda = 0.18,
         model_config = dict(
             augmentation_config = [
-                "AdditiveGaussianNoise",
-                dict(
-                    logvar=0.0,
-                )
+                "NoAugmentation",
             ],
             encoder_config = [
-                "ELICEncoder",
-                dict(
-                    in_channels=3,
-                    hidden_channels=192,
-                    out_channels=256,
-                )
+                "BMSHJEncoder",
             ],
             decoder_config = [
-                "ELICDecoder",
-                dict(
-                    in_channels=256,
-                    hidden_channels=192,
-                    out_channels=3,
-                )
+                "BMSHJDecoder",
             ],
         ),
         optimizer_e_config = [

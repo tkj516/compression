@@ -5,10 +5,14 @@ from compressai.layers import GDN, AttentionBlock
 
 
 class BMSHJDecoder(nn.Module):
-    def __init__(self, out_channels: int = 3, hidden_channels: int = 192):
+    def __init__(self, 
+        in_channels: int = 192,
+        hidden_channels: int = 128,
+        out_channels: int = 3,
+    ):
         super().__init__()
         self.model = nn.Sequential(
-            deconv5x5s2(hidden_channels, hidden_channels),
+            deconv5x5s2(in_channels, hidden_channels),
             GDN(hidden_channels, inverse=True),
             deconv5x5s2(hidden_channels, hidden_channels),
             GDN(hidden_channels, inverse=True),

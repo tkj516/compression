@@ -214,7 +214,7 @@ class Learner:
             b, c, h, w = f_z0.shape
             phi = f_z0.permute(0, 2, 3, 1).reshape(b * h * w, c)
             psi = f_z1.permute(0, 2, 3, 1).reshape(b * h * w, c)
-            loss = self.hscore(phi, psi, biffer_psi=None)
+            loss = self.hscore(phi, psi, buffer_psi=None)
 
             loss.backward()
             optimizer.step()
@@ -225,6 +225,9 @@ class Learner:
             optimizer = self.optimizer_ed
             aux_optimizer = self.optimizer_aux
 
+            optimizer.zero_grad()
+            aux_optimizer.zero_grad()
+
             outputs = self.model(x, num_samples=8)
             recon, likelihoods = outputs["x_hat"], outputs["y_likelihoods"]
 
@@ -233,7 +236,7 @@ class Learner:
 
             bpp_loss = torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
             mse_loss = F.mse_loss(x, recon)
-            rd_loss = bpp_loss + self.rd_lambda * 255.0 ** 2 * mse_loss
+            rd_loss = bpp_loss + self.rd_lambda * (255.0 ** 2) * mse_loss
 
             rd_loss.backward()
             optimizer.step()

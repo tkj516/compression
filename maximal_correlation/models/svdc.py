@@ -1,7 +1,7 @@
 import sys
 sys.path.append("..")
 
-import dacite
+import dacite 
 import torch
 
 from compressai.entropy_models import EntropyBottleneck
@@ -10,14 +10,24 @@ from typing import Any, Mapping
 from ml_collections import ConfigDict
 from dataclasses import dataclass
 
-from layers.additive_gaussian_noise import AdditiveGaussianNoise
-from layers.encoder import ELICEncoder
-from layers.decoder import ELICDecoder
+from modules.additive_gaussian_noise import AdditiveGaussianNoise
+from modules.encoder import BMSHJEncoder, ELICEncoder
+from modules.decoder import BMSHJDecoder, ELICDecoder
 from utils.class_builder import ClassBuilder
 
 
+class NoAugmentation:
+    def __init__(self, **kwargs):
+        del kwargs
+
+    def __call__(self, x: torch.Tensor, num_samples: int, **kwargs):
+        del kwargs
+        return x.unsqueeze(0).repeat(num_samples, 1, 1, 1, 1)
+
+
 AUGMENTATION_REGISTER = {
-    "AdditiveGaussianNoise": AdditiveGaussianNoise
+    "AdditiveGaussianNoise": AdditiveGaussianNoise,
+    "NoAugmentation": NoAugmentation,
 }
 augmentation_builder = ClassBuilder(AUGMENTATION_REGISTER)
 
@@ -29,6 +39,7 @@ class EncoderConfig:
     out_channels: int = 256
 
 ENCODER_REGISTER = {
+    "BMSHJEncoder": BMSHJEncoder,
     "ELICEncoder": ELICEncoder
 }
 encoder_builder = ClassBuilder(ENCODER_REGISTER, EncoderConfig)
@@ -40,6 +51,7 @@ class DecoderConfig:
     out_channels: int = 3
 
 DECODER_REGISTER = {
+    "BMSHJDecoder": BMSHJDecoder,
     "ELICDecoder": ELICDecoder
 }
 decoder_builder = ClassBuilder(DECODER_REGISTER, DecoderConfig)
@@ -48,13 +60,15 @@ decoder_builder = ClassBuilder(DECODER_REGISTER, DecoderConfig)
 class SVDC(CompressionModel):
     def __init__(
         self,
-        config: ConfigDict,
+        augmentation_config: ConfigDict,
+        encoder_config: ConfigDict,
+        decoder_config: ConfigDict,
     ):
         super().__init__()
 
-        self.augmentation = augmentation_builder.build_class(config.augmentation_config)
-        self.encoder, self.encoder_config = encoder_builder.build(config.encoder_config)
-        self.decoder, self.decoder_config = decoder_builder.build(config.decoder_config)
+        self.augmentation = augmentation_builder.build_class(augmentation_config)
+        self.encoder, self.encoder_config = encoder_builder.build(encoder_config)
+        self.decoder, self.decoder_config = decoder_builder.build(decoder_config)
         assert self.encoder_config.out_channels == self.decoder_config.in_channels
 
         self.entropy_bottleneck = EntropyBottleneck(
@@ -90,5 +104,5 @@ class SVDC(CompressionModel):
 
     def decompress(self, strings: Any, shape: torch.Size) -> Mapping[str, torch.Tensor]:
         y_hat = self.entropy_bottleneck.decompress(strings[0], shape)
-        x_hat = self.decode(y_hat)
+        x_hat = self.decode(y_hat).clamp(0, 1)
         return {"x_hat": x_hat}
