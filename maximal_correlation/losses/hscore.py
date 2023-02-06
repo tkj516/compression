@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 centralize = lambda phi: phi - torch.mean(phi, 0)  # centralize over batch dimension (when rows of phi are features)
@@ -41,12 +42,14 @@ class NegativeHScore:  # Frobenius norm for maximal correlation (a.k.a. negative
                 partial_psi = torch.cat([psi[:, :prev_last_dim].detach(),
                                          psi[:, prev_last_dim:i]], dim=-1)
                 partial_buffer_psi = torch.cat([buffer_psi[:, :prev_last_dim].detach(),
-                                                buffer_psi[:, prev_last_dim:i]], dim=-1) if buffer_psi is not None else None
+                                                buffer_psi[:, prev_last_dim:i]],
+                                               dim=-1) if buffer_psi is not None else None
             else:
                 partial_phi = phi[:, :i]
                 partial_psi = psi[:, :i]
                 partial_buffer_psi = buffer_psi[:, :i] if buffer_psi is not None else None
-            loss += self.weights[min(i, self.feature_dim) - 1] * self._frobenius_norm(partial_phi, partial_psi, partial_buffer_psi)
+            loss += self.weights[min(i, self.feature_dim) - 1] * self._frobenius_norm(partial_phi, partial_psi,
+                                                                                      partial_buffer_psi)
             prev_last_dim = i
 
         return loss
@@ -89,3 +92,18 @@ class NegativeHScore:  # Frobenius norm for maximal correlation (a.k.a. negative
             loss += phi.mean(0) @ buffered_psi.mean(0)  # add a scalar to (B, )
 
         return loss * batch_size
+
+
+def compute_norms(model, feature_dim, xs, batch_size):
+    # xs: (n, dim)
+    model.eval()
+    n = len(xs)
+    num_iters = (n // batch_size) + (n % batch_size != 0)
+    coord_2norms = torch.zeros(feature_dim)  # (feature_dim, )
+    for i in range(num_iters):
+        x = xs[i * batch_size:(i + 1) * batch_size]
+        phi = model(x)  # (batch_size, feature_dim)
+        coord_2norms += (phi ** 2).sum(0).data.cpu().numpy()
+    coord_2norms = np.sqrt(coord_2norms / n)
+
+    return coord_2norms  # (feature_dim, )
