@@ -1,15 +1,21 @@
 import torch
 
 centralize = lambda phi: phi - torch.mean(phi, 0)  # centralize over batch dimension (when rows of phi are features)
-get_sample_correlation = lambda phi: (phi.T @ phi) / phi.shape[0]  # sample correlation (when rows of phi are features)
 
 
-class NegativeHScore:  # Frobenius norm for maximal correlation
-    def __init__(self, explicit_centering=True, compute_over_batch=True, nuclear_norm_weight=0.,
-                 feature_dim=0, step=1, weights=None, stop_gradient=False):
+def off_diagonal(x):
+    # return a flattened view of the off-diagonal elements of a square matrix
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+
+class NegativeHScore:  # Frobenius norm for maximal correlation (a.k.a. negative H-score)
+    def __init__(self, feature_dim=0,
+                 compute_over_batch=True, explicit_centering=True,
+                 step=1, weights=None, stop_gradient=False):
         self.explicit_centering = explicit_centering
         self.compute_over_batch = compute_over_batch
-        self.nuclear_norm_weight = nuclear_norm_weight
 
         # parameters for nested objective
         self.feature_dim = feature_dim
@@ -17,59 +23,69 @@ class NegativeHScore:  # Frobenius norm for maximal correlation
         self.weights = weights if weights else [1.] * feature_dim
         self.stop_gradient = stop_gradient
 
+        self.end_indices = list(range(self.step, feature_dim + 1, self.step))
+        if feature_dim not in self.end_indices:
+            self.end_indices.append(feature_dim)
+        print(f"The nested objective will structure the feature vector with the following end indices: "
+              f"{self.end_indices} and weights {self.weights}")
+
     def __call__(self, phi, psi, buffer_psi):
         loss = 0
         prev_last_dim = 0
 
         # compute a nested objective
-        for i in range(self.step, phi.shape[1], self.step):
+        for i in self.end_indices:
             if self.stop_gradient:
-                partial_phi = torch.concat(
-                    [phi[:, :prev_last_dim].detach(),
-                     phi[:, prev_last_dim:i]], dim=-1)
-                partial_psi = torch.concat(
-                    [psi[:, :prev_last_dim].detach(),
-                     psi[:, prev_last_dim:i]], dim=-1)
-                partial_buffer_psi = torch.concat(
-                    [buffer_psi[:, :prev_last_dim].detach(),
-                     buffer_psi[:, prev_last_dim:i]], dim=-1) if buffer_psi is not None else None
+                partial_phi = torch.cat([phi[:, :prev_last_dim].detach(),
+                                         phi[:, prev_last_dim:i]], dim=-1)
+                partial_psi = torch.cat([psi[:, :prev_last_dim].detach(),
+                                         psi[:, prev_last_dim:i]], dim=-1)
+                partial_buffer_psi = torch.cat([buffer_psi[:, :prev_last_dim].detach(),
+                                                buffer_psi[:, prev_last_dim:i]], dim=-1) if buffer_psi is not None else None
             else:
                 partial_phi = phi[:, :i]
                 partial_psi = psi[:, :i]
                 partial_buffer_psi = buffer_psi[:, :i] if buffer_psi is not None else None
-            loss += self.weights[i] * self.negative_hscore(partial_phi, partial_psi, partial_buffer_psi)
+            loss += self.weights[min(i, self.feature_dim) - 1] * self._frobenius_norm(partial_phi, partial_psi, partial_buffer_psi)
             prev_last_dim = i
 
         return loss
 
-    def negative_hscore(self, phi, psi, buffered_psi=None):
+    def _frobenius_norm(self, phi, psi, buffered_psi=None):
         # the reduction assumed here is `sum` (i.e., we take summation over batch)
         # phi, psi: (B, L)
+        use_independent_batch = True
         if buffered_psi is None:
+            use_independent_batch = False
             buffered_psi = psi
         if self.explicit_centering:
             phi = centralize(phi)
             psi = centralize(psi)
 
-        # correlation
-        # NOTE: Added mean here
-        loss = - 2 * (phi * psi).sum(-1).mean()  # (B, )
+        batch_size = phi.shape[0]
+        # note: unlike in FrobeniusNorm, we DO NOT normalize phi and psi by the batch size
+        # loss1 (correlation) = -2 * E_{p(x,y)}[f^T(x) g(y)]
+        loss1 = - 2 * (phi * psi).sum(-1).mean(0)  # scalar
 
-        # compute "correlation" term
-        if self.compute_over_batch:  # complexity = B * B * L
-            correlation = ((phi @ psi.T) ** 2).mean()
-        else:  # complexity = B * L * L
-            lam_f = get_sample_correlation(phi)  # (L, L)
-            lam_g = get_sample_correlation(psi)  # (L, L)
-            correlation = torch.trace(lam_f @ lam_g)
-        loss += correlation  # add a scalar to (B, )
+        # compute loss2 = E_{p(x)p(y)}[(f^T(x) g(y))^2]
+        if self.compute_over_batch:  # complexity = O(B^2 * L) + O(B^2)
+            gram_matrix = phi @ buffered_psi.T  # (B, B); each entry is (f^T(x_i) g(y_j))
+            if use_independent_batch:
+                loss2 = (gram_matrix ** 2).mean()
+            else:
+                # if we compute this term using a single batch psi,
+                # we should exclude the "paired" samples on the diagonal
+                loss2 = (off_diagonal(gram_matrix) ** 2).mean()
+        else:
+            # compute tr(E_{p(x)}[f(x)f^T(x)] E_{p(y)}[g(y)g^T(y)])
+            # complexity = O(B * L^2 + L^3) + O(L)
+            lam_f = (phi.T @ phi) / batch_size  # (L, L)
+            lam_g = (buffered_psi.T @ buffered_psi) / batch_size  # (L, L)
+            loss2 = torch.trace(lam_f @ lam_g)
+
+        loss = loss1 + loss2  # add a scalar to a scalar
 
         if not self.explicit_centering:
             loss += phi.mean(0) @ buffered_psi.mean(0)  # add a scalar to (B, )
 
-        # nuclear norm regularization based on its variational form
-        regularizaton = 0.
-        if self.nuclear_norm_weight > 0:
-            regularizaton = .5 * ((phi ** 2).sum(-1) + (psi ** 2).sum(-1)).mean(0)  # (B, )
-
-        return (loss + self.nuclear_norm_weight * regularizaton).sum(0)
+        return loss * batch_size
