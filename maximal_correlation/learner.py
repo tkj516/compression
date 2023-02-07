@@ -3,9 +3,11 @@ import math
 import dacite
 
 import torch
+import numpy as np
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 from dataclasses import dataclass
 from torch.nn.parallel import DistributedDataParallel
@@ -15,7 +17,7 @@ from tqdm import tqdm
 from typing import Tuple
 
 from models.svdc import SVDC
-from losses.hscore import NegativeHScore
+from losses.hscore import NegativeHScore, compute_norms
 from ml_collections import ConfigDict
 from dataset import ImageNetTrain
 from configs.base_configs import TrainerConfig
@@ -50,6 +52,17 @@ OPTIMIZER_REGISTER = {
 optimizer_builder = ClassBuilder(OPTIMIZER_REGISTER, AdamConfig)
 
 
+class MyDistributedDataParallel(DistributedDataParallel):
+    def __init__(self, model, **kwargs):
+        super(MyDistributedDataParallel, self).__init__(model, **kwargs)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+
 class Learner:
     def __init__(
         self,
@@ -70,21 +83,26 @@ class Learner:
         self.model = model
 
         # Instantiate the optimizers
-        self.optimizer_e = optimizer_builder.build_class(
-            params=self.model.encoder.parameters(),
-            config=cfg.optimizer_e_config,
-        )
+        if not self.trainer_config.joint_optimization:
+            self.optimizer_e = optimizer_builder.build_class(
+                params=self.model.encoder.parameters(),
+                config=cfg.optimizer_e_config,
+            )
         conf = {
             "net": {**{"type": cfg.optimizer_ed_config[0]}, **cfg.optimizer_ed_config[1]},
             "aux": {**{"type": cfg.optimizer_aux_config[0]}, **cfg.optimizer_aux_config[1]},
         }
         optimizer = net_aux_optimizer(self.model, conf)
         self.optimizer_ed, self.optimizer_aux = optimizer["net"], optimizer["aux"]
+        self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_ed, "min")
 
+        self.rd_lambda = cfg.rd_lambda
         self.hscore = NegativeHScore(
             feature_dim=self.model.encoder_config.out_channels
         )
-        self.rd_lambda = cfg.rd_lambda
+        if self.trainer_config.joint_optimization:
+            self.hscore_lambda = cfg.hscore_lambda
 
         # Insantiate a Tensorboard summary writer
         self.writer = SummaryWriter(self.trainer_config.model_dir)
@@ -118,16 +136,13 @@ class Learner:
         )
 
     def state_dict(self):
-        if hasattr(self.model, 'module') and isinstance(self.model.module, nn.Module):
-            model_state = self.model.module.state_dict()
-        else:
-            model_state = self.model.state_dict()
         return {
             "step": self.step,
-            "model": model_state,
-            "optimizer_e": self.optimizer_e.state_dict(),
+            "model": self.model.state_dict(),
+            "optimizer_e": self.optimizer_e.state_dict() if not self.trainer_config.joint_optimization else {},
             "optimizer_ed": self.optimizer_ed.state_dict(),
             "optimizer_aux": self.optimizer_aux.state_dict(),
+            "lr_scheduler": self.lr_scheduler.state_dict(),
             "cfg":  self.cfg.to_dict(),
         }
 
@@ -136,9 +151,11 @@ class Learner:
             self.model.module.load_state_dict(state_dict['model'])
         else:
             self.model.load_state_dict(state_dict['model'])
-        self.optimizer_e.load_state_dict(state_dict['optimizer_e'])
+        if not self.trainer_config.joint_optimization:
+            self.optimizer_e.load_state_dict(state_dict['optimizer_e'])
         self.optimizer_ed.load_state_dict(state_dict['optimizer_ed'])
         self.optimizer_aux.load_state_dict(state_dict['optimizer_aux'])
+        self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
         self.step = state_dict['step']
 
     def save_to_checkpoint(self, filename='weights'):
@@ -160,11 +177,6 @@ class Learner:
         except FileNotFoundError:
             return False
 
-    def hscore_step(self) -> bool:
-        if self.step >= self.trainer_config.hscore_start and self.step % 2 == 1:
-            return True
-        return False
-
     def train(self):
         device = next(self.model.parameters()).device
         while True:
@@ -175,7 +187,10 @@ class Learner:
                 )
             ):
                 x = inputs["image"].to(device)
-                loss = self.train_step(x, logging_rank=self.rank == 0)
+                if self.trainer_config.joint_optimization:
+                    loss = self.train_step_joint(x, logging_rank=self.rank == 0)
+                else:
+                    loss = self.train_step_sep(x, logging_rank=self.rank == 0)
 
                 # Check for NaNs
                 if torch.isnan(loss).any():
@@ -199,9 +214,12 @@ class Learner:
                         print("Ending training...")
                     dist.barrier()
                     exit(0)
+            # At the end of the epoch
+            loss = self.validate()
+            self.lr_scheduler.step(loss)
 
-    def train_step(self, x: torch.Tensor, logging_rank: bool = False):
-        if self.hscore_step():
+    def train_step_sep(self, x: torch.Tensor, logging_rank: bool = False):
+        if self.step >= self.trainer_config.hscore_start and self.step % 2 == 1:
             # Optimize the encoder and don't optimize the entropy model
             # or the decoder
             self.optimizer_e.zero_grad()
@@ -265,6 +283,63 @@ class Learner:
                     'train/recon', quantize_image(recon), self.step)
         return loss
 
+    def train_step_joint(self, x: torch.Tensor, logging_rank: bool = False):
+        self.optimizer_ed.zero_grad()
+        self.optimizer_aux.zero_grad()
+
+        # 1. Get two augmented inputs
+        augmented = self.model.augment(x, num_samples=2)
+        x0, x1 = torch.chunk(augmented, chunks=2, dim=0)
+        x0, x1 = x0.mean(0), x1.mean(0)
+
+        # 2. Encode the augmented inputs
+        f_z = self.model.encode(torch.concatenate([x0, x1], dim=0))
+        f_z0, f_z1 = torch.chunk(f_z, chunks=2, dim=0)
+
+        # 3. Compute the negative hscore loss between the encodings
+        b, c, h, w = f_z0.shape
+        phi = f_z0.permute(0, 2, 3, 1).reshape(b * h * w, c)
+        psi = f_z1.permute(0, 2, 3, 1).reshape(b * h * w, c)
+        hscore_loss = self.hscore(phi, psi, buffer_psi=None)
+
+        # 4. Quantize the latents
+        f_z_hat, likelihoods = self.model.quantize((f_z0 + f_z1) / 2.0)
+
+        # 5. Decoder the images
+        recon = self.model.decode(f_z_hat)
+
+        b, _, h, w = x.shape
+        num_pixels = b * h * w
+        bpp_loss = torch.log(likelihoods).sum() / \
+            (-math.log(2) * num_pixels)
+        mse_loss = F.mse_loss(x, recon)
+        rd_loss = bpp_loss + self.rd_lambda * (255.0 ** 2) * mse_loss
+
+        rd_loss.backward()
+        if self.trainer_config.clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm(
+                self.model.parameters(), self.trainer_config.clip_max_norm)
+        self.optimizer_ed.step()
+
+        aux_loss = self.model.entropy_bottleneck.loss()
+        aux_loss.backward()
+        self.optimizer_aux.step()
+
+        loss = rd_loss + aux_loss + self.hscore_lambda * hscore_loss
+
+        if logging_rank and self.step % self.trainer_config.log_every == 0:
+            self.writer.add_scalar('train/bpp', bpp_loss, self.step)
+            self.writer.add_scalar('train/mse', mse_loss, self.step)
+            self.writer.add_scalar('train/aux_loss', aux_loss, self.step)
+            self.writer.add_scalar('train/rd_loss', rd_loss, self.step)
+            self.writer.add_scalar('train/hscore_loss', hscore_loss, self.step)
+            self.writer.add_scalar(
+                'train/psnr', -10 / math.log(10) * torch.log(mse_loss), self.step)
+            self.writer.add_images('train/gt', quantize_image(x), self.step)
+            self.writer.add_images(
+                'train/recon', quantize_image(recon), self.step)
+        return loss
+
     @torch.no_grad()
     def validate(self):
         device = next(self.model.parameters()).device
@@ -274,13 +349,10 @@ class Learner:
         mse = 0
         aux = 0
         loss = 0
+        count = 0
         for inputs in tqdm(self.val_dataloader, desc=f"Running validation after step {self.step}"):
             x = inputs["image"].to(device)
-            # Use the underlying module to get the losses
-            if self.trainer_config.distributed:
-                outputs = self.model.module(x, num_samples=8)
-            else:
-                outputs = self.model(x, num_samples=8)
+            outputs = self.model(x, num_samples=8)
             recon, likelihoods = outputs["x_hat"], outputs["y_likelihoods"]
 
             b, _, h, w = x.shape
@@ -289,17 +361,18 @@ class Learner:
             bpp_loss = torch.log(likelihoods).sum() / \
                 (-math.log(2) * num_pixels)
             mse_loss = F.mse_loss(x, recon)
-            rd_loss = bpp_loss + self.rd_lambda * 255.0 ** 2 * mse_loss
+            rd_loss = bpp_loss + self.rd_lambda * (255.0 ** 2) * mse_loss
             aux_loss = self.model.entropy_bottleneck.loss()
 
             bpp += bpp_loss
             mse += mse_loss
             aux += aux_loss
             loss += rd_loss
-        bpp = bpp / len(self.val_dataset)
-        mse = mse / len(self.val_dataset)
-        aux = aux / len(self.val_dataset)
-        loss = loss / len(self.val_dataset)
+            count += 1
+        bpp = bpp / count
+        mse = mse / count
+        aux = aux / count
+        loss = loss / count
 
         self.writer.add_scalar('val/bpp', bpp, self.step)
         self.writer.add_scalar('val/mse', mse, self.step)
@@ -309,10 +382,31 @@ class Learner:
                                * torch.log(mse), self.step)
         self.writer.add_images('val/gt', quantize_image(x), self.step)
         self.writer.add_images('val/recon', quantize_image(recon), self.step)
+        self.plot_singular_values(x)
         self.model.train()
 
         return loss
 
+    def plot_singular_values(self, x: torch.Tensor) -> None:
+        def encoder(x: torch.Tensor) -> torch.Tensor:
+            # 1. Augment the input input image and get multiple samples
+            augmented = self.model.augment(x, num_samples=2)
+            x_i = [sample.squeeze(0) for sample in torch.chunk(
+                augmented, chunks=2, dim=0)]
+
+            # 2. Encode the augmented samples and compute the expected values
+            f_z = self.model.encode(torch.concatenate(x_i, dim=0))
+            f_z = sum(torch.chunk(f_z, chunks=2, dim=0)) / 2
+            return f_z
+
+        singular_values = compute_norms(encoder, x, x.shape[0]) ** 2
+
+        fig, axs = plt.subplots()
+        axs.plot(np.arange(len(singular_values)), singular_values)
+        axs.set_xlabel("Feature dim")
+        axs.set_ylabel("Singular Value")
+
+        self.writer.add_figure('val/singular_values', fig, self.step)
 
 def _train_impl(rank: int, model: nn.Module, cfg: ConfigDict):
     torch.backends.cudnn.benchmark = True
@@ -342,5 +436,5 @@ def train_distributed(rank: int, world_size: int, port, cfg: ConfigDict):
     device = torch.device('cuda', rank)
     torch.cuda.set_device(device)
     model = SVDC(**cfg.model_config).to(device)
-    model = DistributedDataParallel(model, device_ids=[rank])
+    model = MyDistributedDataParallel(model, device_ids=[rank])
     _train_impl(rank, model, cfg)

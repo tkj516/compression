@@ -1,9 +1,10 @@
 def get_config():
     config = dict(
         rd_lambda = 0.18,
+        hscore_lambda = 1e-3,
         model_config = dict(
             augmentation_config = [
-                "NoAugmentation",
+                "AdditiveGaussianNoise",
             ],
             encoder_config = [
                 "BMSHJEncoder",
@@ -12,12 +13,6 @@ def get_config():
                 "BMSHJDecoder",
             ],
         ),
-        optimizer_e_config = [
-            "Adam",
-            dict(
-                lr=1e-4,
-            ),
-        ],
         optimizer_ed_config = [
             "Adam",
             dict(
@@ -31,9 +26,10 @@ def get_config():
             ),
         ],
         trainer_config = dict(
-            model_dir="checkpoints/bmshj_scheduler",
-            distributed=False,
-            hscore_start=2_000_000,
+            model_dir="checkpoints/svdc_joint",
+            distributed=True,
+            batch_size=16,
+            joint_optimization=True,
         ),
     )
     return config

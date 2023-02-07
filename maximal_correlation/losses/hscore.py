@@ -1,7 +1,9 @@
 import numpy as np
 import torch
 
-centralize = lambda phi: phi - torch.mean(phi, 0)  # centralize over batch dimension (when rows of phi are features)
+
+# centralize over batch dimension (when rows of phi are features)
+def centralize(phi): return phi - torch.mean(phi, 0)
 
 
 def off_diagonal(x):
@@ -11,10 +13,18 @@ def off_diagonal(x):
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
-class NegativeHScore:  # Frobenius norm for maximal correlation (a.k.a. negative H-score)
-    def __init__(self, feature_dim=0,
-                 compute_over_batch=True, explicit_centering=True,
-                 step=1, weights=None, stop_gradient=False):
+# Frobenius norm for maximal correlation (a.k.a. negative H-score)
+class NegativeHScore:
+    def __init__(
+        self,
+        feature_dim=0,
+        compute_over_batch=True,
+        explicit_centering=True,
+        step=1,
+        weights=None,
+        stop_gradient=False,
+        verbose=False,
+    ):
         self.explicit_centering = explicit_centering
         self.compute_over_batch = compute_over_batch
 
@@ -27,8 +37,9 @@ class NegativeHScore:  # Frobenius norm for maximal correlation (a.k.a. negative
         self.end_indices = list(range(self.step, feature_dim + 1, self.step))
         if feature_dim not in self.end_indices:
             self.end_indices.append(feature_dim)
-        print(f"The nested objective will structure the feature vector with the following end indices: "
-              f"{self.end_indices} and weights {self.weights}")
+        if verbose:
+            print(f"The nested objective will structure the feature vector with the following end indices: "
+                f"{self.end_indices} and weights {self.weights}")
 
     def __call__(self, phi, psi, buffer_psi):
         loss = 0
@@ -47,7 +58,8 @@ class NegativeHScore:  # Frobenius norm for maximal correlation (a.k.a. negative
             else:
                 partial_phi = phi[:, :i]
                 partial_psi = psi[:, :i]
-                partial_buffer_psi = buffer_psi[:, :i] if buffer_psi is not None else None
+                partial_buffer_psi = buffer_psi[:,
+                                                :i] if buffer_psi is not None else None
             loss += self.weights[min(i, self.feature_dim) - 1] * self._frobenius_norm(partial_phi, partial_psi,
                                                                                       partial_buffer_psi)
             prev_last_dim = i
@@ -72,7 +84,8 @@ class NegativeHScore:  # Frobenius norm for maximal correlation (a.k.a. negative
 
         # compute loss2 = E_{p(x)p(y)}[(f^T(x) g(y))^2]
         if self.compute_over_batch:  # complexity = O(B^2 * L) + O(B^2)
-            gram_matrix = phi @ buffered_psi.T  # (B, B); each entry is (f^T(x_i) g(y_j))
+            # (B, B); each entry is (f^T(x_i) g(y_j))
+            gram_matrix = phi @ buffered_psi.T
             if use_independent_batch:
                 loss2 = (gram_matrix ** 2).mean()
             else:
@@ -94,15 +107,17 @@ class NegativeHScore:  # Frobenius norm for maximal correlation (a.k.a. negative
         return loss * batch_size
 
 
-def compute_norms(model, feature_dim, xs, batch_size):
+def compute_norms(model, xs, batch_size):
     # xs: (n, dim)
-    model.eval()
     n = len(xs)
     num_iters = (n // batch_size) + (n % batch_size != 0)
-    coord_2norms = torch.zeros(feature_dim)  # (feature_dim, )
+    coord_2norms = 0  # (feature_dim, )
     for i in range(num_iters):
         x = xs[i * batch_size:(i + 1) * batch_size]
         phi = model(x)  # (batch_size, feature_dim)
+        if len(phi.shape) >= 2:
+            b, c, h, w = phi.shape
+            phi = phi.permute(0, 2, 3, 1).reshape(b * h * w, c)
         coord_2norms += (phi ** 2).sum(0).data.cpu().numpy()
     coord_2norms = np.sqrt(coord_2norms / n)
 

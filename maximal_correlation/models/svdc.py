@@ -6,7 +6,7 @@ import torch
 
 from compressai.entropy_models import EntropyBottleneck
 from compressai.models import CompressionModel
-from typing import Any, Mapping
+from typing import Any, Mapping, Tuple
 from ml_collections import ConfigDict
 from dataclasses import dataclass
 
@@ -80,26 +80,64 @@ class SVDC(CompressionModel):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder(x)
 
+    def quantize(self, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        y_hat, y_likelihoods = self.entropy_bottleneck(y)
+        return y_hat, y_likelihoods
+
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(x)
 
     def forward(self, x: torch.Tensor, num_samples: int) -> Mapping[str, torch.Tensor]:
-        x_a = self.augment(x, num_samples).mean(0)
-        y = self.encode(x_a)
-        y_hat, y_likelihoods = self.entropy_bottleneck(y)
-        x_hat = self.decode(y_hat)
+        # TODO: Look at this again.  I'm going to comment out the old version.
+        # I believe that expectation should be taken after encoder
+        
+        # x_a = self.augment(x, num_samples).mean(0)
+        # y = self.encode(x_a)
+        # y_hat, y_likelihoods = self.entropy_bottleneck(y)
+        # x_hat = self.decode(y_hat)
+        # return {
+        #     "x_hat": x_hat,
+        #     "y_likelihoods": y_likelihoods,
+        # }
+
+        # 1. Augment the input input image and get multiple samples
+        augmented = self.augment(x, num_samples)
+        x_i = [sample.squeeze(0) for sample in torch.chunk(augmented, chunks=num_samples, dim=0)]
+
+        # 2. Encode the augmented samples and compute the expected values
+        f_z = self.encode(torch.concatenate(x_i, dim=0))
+        f_z = sum(torch.chunk(f_z, chunks=num_samples, dim=0)) / num_samples
+        
+        f_z_hat, f_z_likelihoods = self.entropy_bottleneck(f_z)
+        x_hat = self.decode(f_z_hat)
         return {
             "x_hat": x_hat,
-            "y_likelihoods": y_likelihoods,
+            "y_likelihoods": f_z_likelihoods,
         }
 
     def compress(self, x: torch.Tensor, num_samples: int) -> Mapping[str, Any]:
-        x_a = self.augment(x, num_samples)
-        y = self.encode(x_a)
-        y_strings = self.entropy_bottleneck.compress(y)
-        return {
-            "y_strings": [y_strings],
-            "shape": y.size()[-2:],
+        # TODO: Confirm that these changes make sense
+
+        # x_a = self.augment(x, num_samples)
+        # y = self.encode(x_a)
+        # y_strings = self.entropy_bottleneck.compress(y)
+        # return {
+        #     "y_strings": [y_strings],
+        #     "shape": y.size()[-2:],
+        # }
+
+        # 1. Augment the input input image and get multiple samples
+        augmented = self.augment(x, num_samples)
+        x_i = [sample.squeeze(0) for sample in torch.chunk(augmented, chunks=num_samples, dim=0)]
+
+        # 2. Encode the augmented samples and compute the expected values
+        f_z = self.encode(torch.concatenate(x_i, dim=0))
+        f_z = sum(torch.chunk(f_z, chunks=num_samples, dim=0)) / num_samples
+        
+        f_z_strings = self.entropy_bottleneck.compress(f_z)
+        return{
+            "y_strings": [f_z_strings],
+            "shape": f_z.size()[-2:],
         }
 
     def decompress(self, strings: Any, shape: torch.Size) -> Mapping[str, torch.Tensor]:
