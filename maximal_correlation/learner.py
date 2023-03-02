@@ -219,7 +219,7 @@ class Learner:
             self.lr_scheduler.step(loss)
 
     def train_step_sep(self, x: torch.Tensor, logging_rank: bool = False):
-        if self.step >= self.trainer_config.hscore_start and self.step % 2 == 1:
+        if self.step >= self.trainer_config.hscore_start and self.step % self.trainer_config.hscore_freq == 0:
             # Optimize the encoder and don't optimize the entropy model
             # or the decoder
             self.optimizer_e.zero_grad()
@@ -300,7 +300,7 @@ class Learner:
         b, c, h, w = f_z0.shape
         phi = f_z0.permute(0, 2, 3, 1).reshape(b * h * w, c)
         psi = f_z1.permute(0, 2, 3, 1).reshape(b * h * w, c)
-        hscore_loss = self.hscore(phi, psi, buffer_psi=None)
+        hscore_loss = self.hscore(phi, psi, buffer_psi=None) if self.step % self.trainer_config.hscore_freq == 0 else 0
 
         # 4. Quantize the latents
         f_z_hat, likelihoods = self.model.quantize((f_z0 + f_z1) / 2.0)
@@ -315,7 +315,8 @@ class Learner:
         mse_loss = F.mse_loss(x, recon)
         rd_loss = bpp_loss + self.rd_lambda * (255.0 ** 2) * mse_loss
 
-        rd_loss.backward()
+        loss = rd_loss + self.hscore_lambda * hscore_loss
+        loss.backward()
         if self.trainer_config.clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm(
                 self.model.parameters(), self.trainer_config.clip_max_norm)
@@ -325,7 +326,7 @@ class Learner:
         aux_loss.backward()
         self.optimizer_aux.step()
 
-        loss = rd_loss + aux_loss + self.hscore_lambda * hscore_loss
+        loss += aux_loss
 
         if logging_rank and self.step % self.trainer_config.log_every == 0:
             self.writer.add_scalar('train/bpp', bpp_loss, self.step)
@@ -407,6 +408,7 @@ class Learner:
         axs.set_ylabel("Singular Value")
 
         self.writer.add_figure('val/singular_values', fig, self.step)
+
 
 def _train_impl(rank: int, model: nn.Module, cfg: ConfigDict):
     torch.backends.cudnn.benchmark = True
