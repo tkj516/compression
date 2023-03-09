@@ -20,4 +20,5 @@ class TrainerConfig:
     train_fraction: float = 0.8
 
     clip_max_norm: float = 0.0
+    joint_optimization: bool = False
     hscore_freq: int = 1

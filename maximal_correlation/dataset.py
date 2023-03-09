@@ -1,5 +1,7 @@
 import os
+from typing import Any, List, Tuple
 import torch
+import torchvision
 import numpy as np
 from torch.utils.data import Dataset
 import albumentations
@@ -94,4 +96,11 @@ class ImageNetTrain(ImageNetBase):
         self.datadir = os.path.join(self.root, "data")
         self.txt_filelist = os.path.join(self.root, "filelist.txt")
         self.expected_length = 1281167
+
+
+class MNISTBase(torchvision.datasets.MNIST):
+    def __getitem__(self, index: int) -> Tuple[Any]:
+        inputs, _ = super().__getitem__(index)
+        return inputs
+
 

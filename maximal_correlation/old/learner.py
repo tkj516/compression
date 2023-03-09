@@ -3,7 +3,6 @@ import math
 import dacite
 
 import torch
-import torchvision
 import numpy as np
 import torch.distributed as dist
 import torch.nn as nn
@@ -15,16 +14,15 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from typing import List, Tuple
+from typing import Tuple
 
 from models.svdc import SVDC
 from losses.hscore import NegativeHScore, compute_norms
 from ml_collections import ConfigDict
-from dataset import ImageNetTrain, MNISTBase
+from dataset import ImageNetTrain
 from configs.base_configs import TrainerConfig
 from compressai.optimizers import net_aux_optimizer
-from modules.mnist_transform import MNISTTransform
-from utils.class_builder import ClassBuilder
+from maximal_correlation.utils.class_builder import ClassBuilder
 
 
 def get_train_val_dataset(dataset: Dataset, train_fraction: float):
@@ -63,12 +61,6 @@ class MyDistributedDataParallel(DistributedDataParallel):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self.module, name)
-        
-
-def nested_to_device(inputs: List[torch.Tensor], device: torch.device):
-    for i, t in enumerate(inputs):
-        inputs[i] = t.to(device)
-    return inputs
 
 
 class Learner:
@@ -91,6 +83,11 @@ class Learner:
         self.model = model
 
         # Instantiate the optimizers
+        if not self.trainer_config.joint_optimization:
+            self.optimizer_e = optimizer_builder.build_class(
+                params=self.model.encoder.parameters(),
+                config=cfg.optimizer_e_config,
+            )
         conf = {
             "net": {**{"type": cfg.optimizer_ed_config[0]}, **cfg.optimizer_ed_config[1]},
             "aux": {**{"type": cfg.optimizer_aux_config[0]}, **cfg.optimizer_aux_config[1]},
@@ -104,7 +101,8 @@ class Learner:
         self.hscore = NegativeHScore(
             feature_dim=self.model.encoder_config.out_channels
         )
-        self.hscore_lambda = cfg.hscore_lambda
+        if self.trainer_config.joint_optimization:
+            self.hscore_lambda = cfg.hscore_lambda
 
         # Insantiate a Tensorboard summary writer
         self.writer = SummaryWriter(self.trainer_config.model_dir)
@@ -114,13 +112,7 @@ class Learner:
         return self.rank == 0
 
     def build_dataloaders(self):
-        # self.dataset = ImageNetTrain()
-        # TODO: The channel is now built into the dataloader
-        self.dataset = MNISTBase(
-            root="/fs/data/tejasj",
-            download=True,
-            transform=MNISTTransform(),  
-        )
+        self.dataset = ImageNetTrain()
         self.train_dataset, self.val_dataset = get_train_val_dataset(
             self.dataset, self.trainer_config.train_fraction)
 
@@ -147,6 +139,7 @@ class Learner:
         return {
             "step": self.step,
             "model": self.model.state_dict(),
+            "optimizer_e": self.optimizer_e.state_dict() if not self.trainer_config.joint_optimization else {},
             "optimizer_ed": self.optimizer_ed.state_dict(),
             "optimizer_aux": self.optimizer_aux.state_dict(),
             "lr_scheduler": self.lr_scheduler.state_dict(),
@@ -158,6 +151,8 @@ class Learner:
             self.model.module.load_state_dict(state_dict['model'])
         else:
             self.model.load_state_dict(state_dict['model'])
+        if not self.trainer_config.joint_optimization:
+            self.optimizer_e.load_state_dict(state_dict['optimizer_e'])
         self.optimizer_ed.load_state_dict(state_dict['optimizer_ed'])
         self.optimizer_aux.load_state_dict(state_dict['optimizer_aux'])
         self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
@@ -191,8 +186,11 @@ class Learner:
                     desc=f"Training ({self.step} / {self.trainer_config.max_steps})"
                 )
             ):
-                inputs = nested_to_device(inputs, device)
-                loss = self.train_step(inputs, logging_rank=self.rank == 0)
+                x = inputs["image"].to(device)
+                if self.trainer_config.joint_optimization:
+                    loss = self.train_step_joint(x, logging_rank=self.rank == 0)
+                else:
+                    loss = self.train_step_sep(x, logging_rank=self.rank == 0)
 
                 # Check for NaNs
                 if torch.isnan(loss).any():
@@ -220,42 +218,101 @@ class Learner:
             loss = self.validate()
             self.lr_scheduler.step(loss)
 
-    def train_step(self, inputs: List[torch.Tensor], logging_rank: bool = False):
+    def train_step_sep(self, x: torch.Tensor, logging_rank: bool = False):
+        if self.step >= self.trainer_config.hscore_start and self.step % self.trainer_config.hscore_freq == 0:
+            # Optimize the encoder and don't optimize the entropy model
+            # or the decoder
+            self.optimizer_e.zero_grad()
+
+            # 1. Get two augmented inputs
+            augmented = self.model.augment(x, num_samples=2)
+            z0, z1 = torch.chunk(augmented, chunks=2, dim=0)
+            z0, z1 = z0.mean(0), z1.mean(0)
+
+            # 2. Encode the augmented inputs
+            f_z = self.model.encode(torch.concatenate([z0, z1], dim=0))
+            f_z0, f_z1 = torch.chunk(f_z, chunks=2, dim=0)
+
+            # 3. Compute the negative hscore loss between the encodings
+            b, c, h, w = f_z0.shape
+            phi = f_z0.permute(0, 2, 3, 1).reshape(b * h * w, c)
+            psi = f_z1.permute(0, 2, 3, 1).reshape(b * h * w, c)
+            loss = self.hscore(phi, psi, buffer_psi=None)
+
+            loss.backward()
+            self.optimizer_e.step()
+
+            if logging_rank and self.step % self.trainer_config.log_every == 1:
+                self.writer.add_scalar('train/hscore_loss', loss, self.step)
+        else:
+            self.optimizer_ed.zero_grad()
+            self.optimizer_aux.zero_grad()
+
+            outputs = self.model(x, num_samples=8)
+            recon, likelihoods = outputs["x_hat"], outputs["y_likelihoods"]
+
+            b, _, h, w = x.shape
+            num_pixels = b * h * w
+
+            bpp_loss = torch.log(likelihoods).sum() / \
+                (-math.log(2) * num_pixels)
+            mse_loss = F.mse_loss(x, recon)
+            rd_loss = bpp_loss + self.rd_lambda * (255.0 ** 2) * mse_loss
+
+            rd_loss.backward()
+            if self.trainer_config.clip_max_norm > 0:
+                torch.nn.utils.clip_grad_norm(
+                    self.model.parameters(), self.trainer_config.clip_max_norm)
+            self.optimizer_ed.step()
+
+            aux_loss = self.model.entropy_bottleneck.loss()
+            aux_loss.backward()
+            self.optimizer_aux.step()
+
+            loss = rd_loss + aux_loss
+
+            if logging_rank and self.step % self.trainer_config.log_every == 0:
+                self.writer.add_scalar('train/bpp', bpp_loss, self.step)
+                self.writer.add_scalar('train/mse', mse_loss, self.step)
+                self.writer.add_scalar('train/aux_loss', aux_loss, self.step)
+                self.writer.add_scalar('train/rd_loss', rd_loss, self.step)
+                self.writer.add_scalar(
+                    'train/psnr', -10 / math.log(10) * torch.log(mse_loss), self.step)
+                self.writer.add_images('train/gt', quantize_image(x), self.step)
+                self.writer.add_images(
+                    'train/recon', quantize_image(recon), self.step)
+        return loss
+
+    def train_step_joint(self, x: torch.Tensor, logging_rank: bool = False):
         self.optimizer_ed.zero_grad()
         self.optimizer_aux.zero_grad()
 
         # 1. Get two augmented inputs
-        x, z, z_p = inputs
+        augmented = self.model.augment(x, num_samples=2)
+        x0, x1 = torch.chunk(augmented, chunks=2, dim=0)
+        x0, x1 = x0.mean(0), x1.mean(0)
 
         # 2. Encode the augmented inputs
-        f_zs = self.model.feature_encode(torch.concatenate([z, z_p], dim=0))
-        f_z, f_z_p = torch.chunk(f_zs, chunks=2, dim=0)
+        f_z = self.model.encode(torch.concatenate([x0, x1], dim=0))
+        f_z0, f_z1 = torch.chunk(f_z, chunks=2, dim=0)
 
         # 3. Compute the negative hscore loss between the encodings
-        b, c, h, w = f_z.shape
-        phi = f_z.permute(0, 2, 3, 1).reshape(b * h * w, c)
-        psi = f_z_p.permute(0, 2, 3, 1).reshape(b * h * w, c)
+        b, c, h, w = f_z0.shape
+        phi = f_z0.permute(0, 2, 3, 1).reshape(b * h * w, c)
+        psi = f_z1.permute(0, 2, 3, 1).reshape(b * h * w, c)
         hscore_loss = self.hscore(phi, psi, buffer_psi=None) if self.step % self.trainer_config.hscore_freq == 0 else 0
 
-        # 4. Mask the encoded augmented samples
-        mask_percent = np.random.rand()
-        mask = torch.ones(*f_z.shape)
-        mask[..., : int(f_z.shape[-1] * (1 - mask_percent))] = 0.0
-        f_z_m = f_z * mask.to(f_z.device)
+        # 4. Quantize the latents
+        f_z_hat, likelihoods = self.model.quantize((f_z0 + f_z1) / 2.0)
 
-        # 5. Encode and compress the image
-        c = self.model.conditioner(f_z_m)
-        w = self.model.encode(x, c)
-        w_hat, w_likelihoods = self.model.entropy_bottleneck(w)
+        # 5. Decoder the images
+        recon = self.model.decode(f_z_hat)
 
-        # 6. Decode the image
-        x_hat = self.model.decode(torch.concatenate([f_z_m, w_hat], dim=1))
-
-        b, _, h, ww = x.shape
-        num_pixels = b * h * ww
-        bpp_loss = torch.log(w_likelihoods).sum() / \
+        b, _, h, w = x.shape
+        num_pixels = b * h * w
+        bpp_loss = torch.log(likelihoods).sum() / \
             (-math.log(2) * num_pixels)
-        mse_loss = F.mse_loss(x, x_hat)
+        mse_loss = F.mse_loss(x, recon)
         rd_loss = bpp_loss + self.rd_lambda * (255.0 ** 2) * mse_loss
 
         loss = rd_loss + self.hscore_lambda * hscore_loss
@@ -272,7 +329,6 @@ class Learner:
         loss += aux_loss
 
         if logging_rank and self.step % self.trainer_config.log_every == 0:
-            self.writer.add_scalar('train/mask_percent', mask_percent, self.step)
             self.writer.add_scalar('train/bpp', bpp_loss, self.step)
             self.writer.add_scalar('train/mse', mse_loss, self.step)
             self.writer.add_scalar('train/aux_loss', aux_loss, self.step)
@@ -282,7 +338,7 @@ class Learner:
                 'train/psnr', -10 / math.log(10) * torch.log(mse_loss), self.step)
             self.writer.add_images('train/gt', quantize_image(x), self.step)
             self.writer.add_images(
-                'train/recon', quantize_image(x_hat), self.step)
+                'train/recon', quantize_image(recon), self.step)
         return loss
 
     @torch.no_grad()
@@ -295,13 +351,11 @@ class Learner:
         aux = 0
         loss = 0
         count = 0
-        m = np.random.choice([0.25, 0.5, 0.75, 1.0])
         for inputs in tqdm(self.val_dataloader, desc=f"Running validation after step {self.step}"):
-            inputs = nested_to_device(inputs, device)
-            outputs = self.model(inputs, mask_percent=m)
-            recon, likelihoods = outputs["x_hat"], outputs["w_likelihoods"]
+            x = inputs["image"].to(device)
+            outputs = self.model(x, num_samples=8)
+            recon, likelihoods = outputs["x_hat"], outputs["y_likelihoods"]
 
-            x = inputs[0]
             b, _, h, w = x.shape
             num_pixels = b * h * w
 
@@ -321,25 +375,32 @@ class Learner:
         aux = aux / count
         loss = loss / count
 
-        self.writer.add_scalar(f'val/{m}/bpp', bpp, self.step)
-        self.writer.add_scalar(f'val/{m}/mse', mse, self.step)
-        self.writer.add_scalar(f'val/{m}/aux_loss', aux, self.step)
-        self.writer.add_scalar(f'val/{m}/rd_loss', loss, self.step)
-        self.writer.add_scalar(f'val/{m}/psnr', -10 / math.log(10)
+        self.writer.add_scalar('val/bpp', bpp, self.step)
+        self.writer.add_scalar('val/mse', mse, self.step)
+        self.writer.add_scalar('val/aux_loss', aux, self.step)
+        self.writer.add_scalar('val/rd_loss', loss, self.step)
+        self.writer.add_scalar('val/psnr', -10 / math.log(10)
                                * torch.log(mse), self.step)
-        self.writer.add_images(f'val/{m}/gt', quantize_image(x), self.step)
-        self.writer.add_images(f'val/{m}/recon', quantize_image(recon), self.step)
-        self.plot_singular_values(inputs)
+        self.writer.add_images('val/gt', quantize_image(x), self.step)
+        self.writer.add_images('val/recon', quantize_image(recon), self.step)
+        self.plot_singular_values(x)
         self.model.train()
 
         return loss
 
-    def plot_singular_values(self, inputs: List[torch.Tensor]) -> None:
-        def encoder(z: torch.Tensor) -> torch.Tensor:
-            return self.model.feature_encode(z)
+    def plot_singular_values(self, x: torch.Tensor) -> None:
+        def encoder(x: torch.Tensor) -> torch.Tensor:
+            # 1. Augment the input input image and get multiple samples
+            augmented = self.model.augment(x, num_samples=2)
+            x_i = [sample.squeeze(0) for sample in torch.chunk(
+                augmented, chunks=2, dim=0)]
 
-        _, z, _ = inputs
-        singular_values = compute_norms(encoder, z, z.shape[0]) ** 2
+            # 2. Encode the augmented samples and compute the expected values
+            f_z = self.model.encode(torch.concatenate(x_i, dim=0))
+            f_z = sum(torch.chunk(f_z, chunks=2, dim=0)) / 2
+            return f_z
+
+        singular_values = compute_norms(encoder, x, x.shape[0]) ** 2
 
         fig, axs = plt.subplots()
         axs.plot(np.arange(len(singular_values)), singular_values)
