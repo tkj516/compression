@@ -18,13 +18,19 @@ from tqdm import tqdm
 from typing import List, Tuple
 
 from models.svdc import SVDC
-from losses.hscore import NegativeHScore, compute_norms
+from losses.frobenius import NestedFrobeniusLoss, compute_norms
 from ml_collections import ConfigDict
 from dataset import ImageNetTrain, MNISTBase
 from configs.base_configs import TrainerConfig
 from compressai.optimizers import net_aux_optimizer
 from modules.mnist_transform import MNISTTransform
 from utils.class_builder import ClassBuilder
+
+
+def normalize_l2ball(z, r):
+    # normalize each row to have l2-norm <= r
+    mask = (torch.norm(z, p=2, dim=-1) < r).float().unsqueeze(1)  # (B, 1)
+    return mask * z + (1 - mask) * r * F.normalize(z, p=2, dim=1)
 
 
 def get_train_val_dataset(dataset: Dataset, train_fraction: float):
@@ -101,10 +107,10 @@ class Learner:
             self.optimizer_ed, "min")
 
         self.rd_lambda = cfg.rd_lambda
-        self.hscore = NegativeHScore(
-            feature_dim=self.model.encoder_config.out_channels
+        self.nested_frobenius_loss = NestedFrobeniusLoss(
+            end_indices=np.arange(1, self.model.encoder_config.out_channels + 1)
         )
-        self.hscore_lambda = cfg.hscore_lambda
+        self.frobenius_lambda = cfg.frobenius_lambda
 
         # Insantiate a Tensorboard summary writer
         self.writer = SummaryWriter(self.trainer_config.model_dir)
@@ -228,14 +234,19 @@ class Learner:
         x, z, z_p = inputs
 
         # 2. Encode the augmented inputs
-        f_zs = self.model.feature_encode(torch.concatenate([z, z_p], dim=0))
+        f_zs = self.model.feature_encode(torch.cat([z, z_p], dim=0))
         f_z, f_z_p = torch.chunk(f_zs, chunks=2, dim=0)
 
         # 3. Compute the negative hscore loss between the encodings
         b, c, h, w = f_z.shape
+        # reshaping for learning "patch" features
         phi = f_z.permute(0, 2, 3, 1).reshape(b * h * w, c)
         psi = f_z_p.permute(0, 2, 3, 1).reshape(b * h * w, c)
-        hscore_loss = self.hscore(phi, psi, buffer_psi=None) if self.step % self.trainer_config.hscore_freq == 0 else 0
+        # l2-ball projection
+        phi = normalize_l2ball(phi, r=np.sqrt(self.cfg.mu))
+        psi = normalize_l2ball(psi, r=np.sqrt(self.cfg.mu))
+        # compute
+        hscore_loss = self.nested_frobenius_loss(phi, psi) if self.step % self.trainer_config.hscore_freq == 0 else 0
 
         # 4. Mask the encoded augmented samples
         mask_percent = np.random.rand()
@@ -249,7 +260,7 @@ class Learner:
         w_hat, w_likelihoods = self.model.entropy_bottleneck(w)
 
         # 6. Decode the image
-        x_hat = self.model.decode(torch.concatenate([f_z_m, w_hat], dim=1))
+        x_hat = self.model.decode(torch.cat([f_z_m, w_hat], dim=1))
 
         b, _, h, ww = x.shape
         num_pixels = b * h * ww
@@ -258,7 +269,7 @@ class Learner:
         mse_loss = F.mse_loss(x, x_hat)
         rd_loss = bpp_loss + self.rd_lambda * (255.0 ** 2) * mse_loss
 
-        loss = rd_loss + self.hscore_lambda * hscore_loss
+        loss = rd_loss + self.frobenius_lambda * hscore_loss
         loss.backward()
         if self.trainer_config.clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm(

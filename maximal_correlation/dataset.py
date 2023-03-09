@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 import albumentations
 from PIL import Image
 
+
 class ImagePaths(Dataset):
     def __init__(self, paths, size=None, random_crop=False):
         self.size = size

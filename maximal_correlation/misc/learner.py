@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from models.vae import GaussianVAE
-from losses.hscore import NegativeHScore
+from losses.frobenius import NestedFrobeniusLoss
 from losses.kl import KLLoss
 from ml_collections import ConfigDict
 from dataset import ImageNetTrain
@@ -60,7 +60,7 @@ class Learner:
             min_logvar=self.kl_loss_config.min_logvar,
             max_logvar=self.kl_loss_config.max_logvar,
         )
-        self.hscore = NegativeHScore(**cfg.hscore_loss_config)
+        self.hscore = NestedFrobeniusLoss(**cfg.hscore_loss_config)
         self.l1 = nn.L1Loss()
 
         self.writer = SummaryWriter(self.trainer_config.model_dir)

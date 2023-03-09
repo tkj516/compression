@@ -78,7 +78,7 @@ class SVDC(CompressionModel):
         return self.decoder(x)
 
     def forward(self, inputs: List[torch.Tensor], mask_percent: float) -> Mapping[str, torch.Tensor]:
-        # 1. Augment the input input image and get two sampless
+        # 1. Augment the input input image and get two samples
         x, z, _ = inputs
 
         # 2. Encode the augmented sample

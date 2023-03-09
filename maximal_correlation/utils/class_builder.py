@@ -11,6 +11,7 @@ def get_default_args(func):
         if v.default is not inspect.Parameter.empty
     }
 
+
 class ClassBuilder:
     def __init__(
         self,

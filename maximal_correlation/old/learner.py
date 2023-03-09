@@ -17,7 +17,7 @@ from tqdm import tqdm
 from typing import Tuple
 
 from models.svdc import SVDC
-from losses.hscore import NegativeHScore, compute_norms
+from losses.frobenius import NestedFrobeniusLoss, compute_norms
 from ml_collections import ConfigDict
 from dataset import ImageNetTrain
 from configs.base_configs import TrainerConfig
@@ -98,7 +98,7 @@ class Learner:
             self.optimizer_ed, "min")
 
         self.rd_lambda = cfg.rd_lambda
-        self.hscore = NegativeHScore(
+        self.hscore = NestedFrobeniusLoss(
             feature_dim=self.model.encoder_config.out_channels
         )
         if self.trainer_config.joint_optimization:
